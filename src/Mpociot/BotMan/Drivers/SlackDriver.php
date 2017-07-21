@@ -17,6 +17,14 @@ class SlackDriver extends Driver
 {
     const DRIVER_NAME = 'Slack';
 
+    protected $botID;
+
+    /** @var string */
+    protected $botUserID;
+
+    /** @var string */
+    protected $botUserName;
+
     /**
      * @param Request $request
      */
@@ -26,7 +34,7 @@ class SlackDriver extends Driver
          * If the request has a POST parameter called 'payload'
          * we're dealing with an interactive button response.
          */
-        if (! is_null($request->get('payload'))) {
+        if (!is_null($request->get('payload'))) {
             $payloadData = json_decode($request->get('payload'), true);
 
             $this->payload = Collection::make($payloadData);
@@ -34,13 +42,26 @@ class SlackDriver extends Driver
                 'channel' => $payloadData['channel']['id'],
                 'user' => $payloadData['user']['id'],
             ]);
-        } elseif (! is_null($request->get('team_domain'))) {
+        } elseif (!is_null($request->get('team_domain'))) {
             $this->payload = $request->request;
             $this->event = Collection::make($request->request->all());
         } else {
-            $this->payload = new ParameterBag((array) json_decode($request->getContent(), true));
+            $this->payload = new ParameterBag((array)json_decode($request->getContent(), true));
             $this->event = Collection::make($this->payload->get('event'));
         }
+
+        $this->getBotUserId();
+
+        Log::info('event - ' . print_r($this->event, true));
+        Log::info('bot id - ' . $this->botID);
+        Log::info('bot userid - ' . $this->botUserID);
+        Log::info('bot name - ' . $this->botUserName);
+        $botIdCheck = $this->event->get('bot_id') == $this->botID ? 'true' : 'false';
+        $botUserIdCheck = $this->event->get('user') == $this->botUserID ? 'true' : 'false';
+        $botUserNameCheck = $this->event->get('username') == $this->botUserName ? 'true' : 'false';
+        Log::info('bot ids match -' . $botIdCheck);
+        Log::info('bot user ids match -' . $botUserIdCheck);
+        Log::info('bot user names match -' . $botUserNameCheck);
     }
 
     /**
@@ -50,7 +71,7 @@ class SlackDriver extends Driver
      */
     public function matchesRequest()
     {
-        return ! is_null($this->event->get('user')) || ! is_null($this->event->get('team_domain'));
+        return !is_null($this->event->get('user')) || !is_null($this->event->get('team_domain'));
     }
 
     /**
@@ -78,10 +99,10 @@ class SlackDriver extends Driver
     public function getMessages()
     {
         $messageText = '';
-        if (! $this->payload instanceof Collection) {
+        if (!$this->payload instanceof Collection) {
             $messageText = $this->event->get('text');
             if ($this->isSlashCommand()) {
-                $messageText = $this->event->get('command').' '.$messageText;
+                $messageText = $this->event->get('command') . ' ' . $messageText;
             }
         }
 
@@ -103,7 +124,8 @@ class SlackDriver extends Driver
      */
     public function isBot()
     {
-        return $this->event->has('bot_id');
+        return ($this->event->has('user') && $this->event->get('user') == $this->botUserID) ||
+            ($this->event->has('bot_id') && $this->event->get('bot_id') == $this->botID);
     }
 
     /**
@@ -122,8 +144,10 @@ class SlackDriver extends Driver
      */
     public function reply($message, $matchingMessage, $additionalParameters = [])
     {
-        if (! Collection::make($matchingMessage->getPayload())->has('team_domain')) {
+        if (!Collection::make($matchingMessage->getPayload())->has('team_domain')) {
             $this->replyWithToken($message, $matchingMessage, $additionalParameters);
+        } elseif ($this->isSlashCommand()) {
+            $this->respondText($message, $matchingMessage, $additionalParameters);
         } else {
             $this->respondJSON($message, $matchingMessage, $additionalParameters);
         }
@@ -159,14 +183,14 @@ class SlackDriver extends Driver
             $parameters['attachments'] = json_encode([$message->toArray()]);
         } elseif ($message instanceof IncomingMessage) {
             $parameters['text'] = $message->getMessage();
-            if (! is_null($message->getImage())) {
+            if (!is_null($message->getImage())) {
                 $parameters['attachments'] = json_encode(['image_url' => $message->getImage()]);
             }
         } else {
             $parameters['text'] = $this->format($message);
         }
 
-        JsonResponse::create($parameters)->send();
+        Response::create(json_encode($parameters))->send();
     }
 
     /**
@@ -213,7 +237,7 @@ class SlackDriver extends Driver
             $parameters['attachments'] = json_encode([$message->toArray()]);
         } elseif ($message instanceof IncomingMessage) {
             $parameters['text'] = $message->getMessage();
-            if (! is_null($message->getImage())) {
+            if (!is_null($message->getImage())) {
                 $parameters['attachments'] = json_encode(['image_url' => $message->getImage()]);
             }
         } else {
@@ -245,7 +269,7 @@ class SlackDriver extends Driver
      */
     public function isConfigured()
     {
-        return ! is_null($this->config->get('slack_token'));
+        return !is_null($this->config->get('slack_token'));
     }
 
     /**
@@ -272,6 +296,40 @@ class SlackDriver extends Driver
             'token' => $this->config->get('slack_token'),
         ], $parameters);
 
-        return $this->http->post('https://slack.com/api/'.$endpoint, [], $parameters);
+        return $this->http->post('https://slack.com/api/' . $endpoint, [], $parameters);
+    }
+
+    /**
+     * Get the userID of the botman bot
+     *
+     */
+    private function getBotUserId()
+    {
+        $message = $this->getMessages()[0];
+        $botUserIdRequest = $this->sendRequest('auth.test', [], $message);
+        $botUserIdPayload = new ParameterBag((array)json_decode($botUserIdRequest->getContent(), true));
+
+        if ($botUserIdPayload->get('user_id')) {
+            $this->botUserID = $botUserIdPayload->get('user_id');
+            $this->getBotUserInfo();
+        }
+    }
+
+    /**
+     * Get the botID and userName of the botman bot if available
+     *
+     */
+    private function getBotUserInfo()
+    {
+        $message = $this->getMessages()[0];
+        $botUserNameRequest = $this->sendRequest('users.info', ['user' => $this->botUserID], $message);
+        $botUserNamePayload = (array)json_decode($botUserNameRequest->getContent(), true);
+
+        if ($botUserNamePayload['user']['name']) {
+            $this->botUserName = ucfirst($botUserNamePayload['user']['name']);
+        }
+        if ($botUserNamePayload['user']['is_bot']) {
+            $this->botID = $botUserNamePayload['user']['profile']['bot_id'];
+        }
     }
 }
